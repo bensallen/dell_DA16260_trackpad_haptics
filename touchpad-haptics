@@ -1,0 +1,185 @@
+#!/usr/bin/python3
+"""Set haptic feedback strength on HID haptic touchpads (Haptics page 0x0E, Intensity 0x23).
+
+The Dell XPS 16 DA16260 touchpad only distinguishes five steps of the 0-100
+intensity range: off, 1 (25), 2 (50), 3 (75) and 4 (100). Other values fall
+back to level 2.
+"""
+
+import argparse
+import fcntl
+import glob
+import os
+import sys
+
+HID_UP_HAPTIC = 0x0E
+HID_HP_INTENSITY = 0x23
+CONFIG = "/etc/touchpad-haptics.conf"
+LEVELS = ("off", "1", "2", "3", "4")
+DEFAULT_LEVEL = "2"
+
+
+def _ioc(direction, nr, size):
+    return (direction << 30) | (size << 16) | (ord("H") << 8) | nr
+
+
+def hidiocsfeature(size):
+    return _ioc(3, 0x06, size)
+
+
+def hidiocgfeature(size):
+    return _ioc(3, 0x07, size)
+
+
+def find_intensity_report(desc):
+    """Return (report_id, logical_min, logical_max) for the haptic intensity feature, or None."""
+    i = 0
+    usage_page = 0
+    report_id = 0
+    log_min = log_max = 0
+    stack = []
+    usages = []
+    while i < len(desc):
+        b = desc[i]
+        if b == 0xFE:  # long item
+            i += 3 + desc[i + 1]
+            continue
+        size = (0, 1, 2, 4)[b & 3]
+        typ = (b >> 2) & 3
+        tag = b >> 4
+        data = desc[i + 1:i + 1 + size]
+        val = int.from_bytes(data, "little")
+        sval = int.from_bytes(data, "little", signed=True) if size else 0
+        i += 1 + size
+
+        if typ == 1:  # global
+            if tag == 0x0:
+                usage_page = val
+            elif tag == 0x1:
+                log_min = sval
+            elif tag == 0x2:
+                log_max = val if log_min >= 0 else sval
+            elif tag == 0x8:
+                report_id = val
+            elif tag == 0xA:
+                stack.append((usage_page, report_id, log_min, log_max))
+            elif tag == 0xB and stack:
+                usage_page, report_id, log_min, log_max = stack.pop()
+        elif typ == 2 and tag == 0x0:  # local usage
+            usages.append(val if size == 4 else (usage_page << 16) | val)
+        elif typ == 0:  # main
+            if tag == 0xB and ((HID_UP_HAPTIC << 16) | HID_HP_INTENSITY) in usages:
+                return report_id, log_min, log_max
+            usages = []
+    return None
+
+
+def find_device():
+    for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        try:
+            with open(os.path.join(node, "device/report_descriptor"), "rb") as f:
+                info = find_intensity_report(f.read())
+        except OSError:
+            continue
+        if info:
+            return "/dev/" + os.path.basename(node), info
+    return None, None
+
+
+def get_intensity(fd, report_id):
+    buf = bytearray([report_id, 0])
+    fcntl.ioctl(fd, hidiocgfeature(len(buf)), buf)
+    return buf[1]
+
+
+def set_intensity(fd, report_id, value):
+    buf = bytearray([report_id, value])
+    fcntl.ioctl(fd, hidiocsfeature(len(buf)), buf)
+
+
+def parse_level(text):
+    text = text.strip().lower()
+    if text == "0":
+        text = "off"
+    if text not in LEVELS:
+        raise ValueError(f"invalid level {text!r} (choose from {', '.join(LEVELS)})")
+    return LEVELS.index(text)
+
+
+def level_to_value(level, lmin, lmax):
+    return lmin + (lmax - lmin) * level // 4
+
+
+def configured_level():
+    try:
+        with open(CONFIG) as f:
+            for line in f:
+                key, _, val = line.partition("=")
+                if key.strip() == "LEVEL":
+                    return parse_level(val)
+    except OSError:
+        pass
+    except ValueError as e:
+        print(f"{CONFIG}: {e}, using level {DEFAULT_LEVEL}", file=sys.stderr)
+    return parse_level(DEFAULT_LEVEL)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("-d", "--device", help="hidraw device (auto-detected by default)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("get", help="print current raw intensity (not supported by all devices)")
+    s = sub.add_parser("set", help="set level: off, 1, 2, 3 or 4")
+    s.add_argument("level", help="off (or 0), 1, 2, 3, 4; with --raw, a value in the device range")
+    s.add_argument("--raw", action="store_true", help="send LEVEL unchanged as the raw intensity value")
+    sub.add_parser("apply", help=f"set level from {CONFIG}")
+    sub.add_parser("info", help="show detected device and report")
+    args = p.parse_args()
+
+    dev, info = find_device()
+    if args.device:
+        dev = args.device
+    if not dev or not info:
+        sys.exit("No touchpad with a haptic intensity feature report found")
+    report_id, lmin, lmax = info
+
+    if args.cmd == "info":
+        print(f"device={dev} report_id=0x{report_id:02x} range={lmin}..{lmax}")
+        return
+
+    if args.cmd == "get":
+        value = None
+    elif args.cmd == "apply":
+        value = level_to_value(configured_level(), lmin, lmax)
+    elif args.raw:
+        try:
+            value = int(args.level)
+        except ValueError:
+            sys.exit("--raw requires an integer value")
+        if not lmin <= value <= lmax:
+            sys.exit(f"Value must be in {lmin}..{lmax}")
+    else:
+        try:
+            value = level_to_value(parse_level(args.level), lmin, lmax)
+        except ValueError as e:
+            sys.exit(str(e))
+
+    try:
+        fd = os.open(dev, os.O_RDWR)
+    except PermissionError:
+        sys.exit(f"Permission denied opening {dev} (run as root or install the udev rule)")
+
+    try:
+        if args.cmd == "get":
+            try:
+                print(get_intensity(fd, report_id))
+            except OSError as e:
+                sys.exit(f"Device rejected GET_FEATURE 0x{report_id:02x}: {e.strerror}")
+        else:
+            set_intensity(fd, report_id, value)
+    finally:
+        os.close(fd)
+
+
+if __name__ == "__main__":
+    main()

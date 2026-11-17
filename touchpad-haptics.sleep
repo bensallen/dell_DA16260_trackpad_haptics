@@ -1,0 +1,4 @@
+#!/bin/sh
+# systemd-sleep hook: reapply touchpad haptic level after resume.
+[ "$1" = "post" ] && /usr/bin/touchpad-haptics apply
+exit 0

@@ -1,0 +1,4 @@
+# Synaptics 06CB:D01A haptic touchpad (Dell XPS 16 DA16260)
+# Grants the logged-in user access to the hidraw node and applies the configured level.
+ACTION=="add", SUBSYSTEM=="hidraw", KERNELS=="0018:06CB:D01A.*", TAG+="uaccess", \
+  RUN+="/usr/bin/touchpad-haptics -d $devnode apply"

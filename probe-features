@@ -1,0 +1,42 @@
+#!/usr/bin/python3
+"""Try GET_FEATURE on every feature report of the touchpad and report results."""
+
+import fcntl
+import os
+import sys
+
+DEV = sys.argv[1] if len(sys.argv) > 1 else "/dev/hidraw1"
+
+# report id -> payload length in bytes (from the report descriptor)
+FEATURES = {
+    0x04: 1,    # Contact count maximum
+    0x06: 1,    # Surface/button switch
+    0x07: 256,  # Vendor (Windows certification blob)
+    0x08: 1,    # Pad type / button type
+    0x0D: 1,    # Latency mode
+    0x0E: 1,    # Vendor
+    0x0F: 3,    # Vendor
+    0x22: 64,   # Vendor
+    0x37: 1,    # Haptic intensity
+    0x38: 9,    # Vendor (0xff81)
+    0x39: 62,   # Vendor (0xff81)
+    0x50: 1,    # Vendor
+}
+
+
+def hidiocgfeature(size):
+    return (3 << 30) | (size << 16) | (ord("H") << 8) | 0x07
+
+
+fd = os.open(DEV, os.O_RDWR)
+for rid, length in FEATURES.items():
+    buf = bytearray([rid] + [0] * length)
+    try:
+        n = fcntl.ioctl(fd, hidiocgfeature(len(buf)), buf)
+        data = bytes(buf[1:]).hex(" ")
+        if len(data) > 60:
+            data = data[:60] + " ..."
+        print(f"0x{rid:02x}: OK  {data}")
+    except OSError as e:
+        print(f"0x{rid:02x}: ERR {e.strerror}")
+os.close(fd)
